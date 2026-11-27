@@ -1,11 +1,11 @@
-# The War of Free
+# The War of Freedom
 Adapted from the game *War the Knights*, but no textures or maps were copied.
 
 ## Current progress
 - [x] The basic map and game character
 - [x] Melee wepons, bow , shield and armor
-- [ ] Throwing knife and fire arrow
-- [ ] Kick, lying down and crawl
+- [x] Throwing knife and fire arrow
+- [x] Kick, lying down and crawl
 - [ ] Terrain and more maps
 - [ ] The Knights' AI
 - [ ] Story plot
