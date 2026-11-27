@@ -26,3 +26,4 @@ mono_crash.*.json
 
 # Test folder (I created)
 tests/
+builds/
