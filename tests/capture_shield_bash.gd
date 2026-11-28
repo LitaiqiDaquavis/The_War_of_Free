@@ -13,6 +13,7 @@ func capture() -> void:
 	var world: Node = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "res://tests/capture-settings.cfg"
 	world.training_mode = true
+	world.battle_mode = false
 	root.add_child(world)
 	world.start_game()
 	var player: Node = world.player

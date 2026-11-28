@@ -27,6 +27,7 @@ func _initialize() -> void:
 func run() -> void:
 	var world: Node = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "user://death-lifecycle-test.cfg"
+	world.battle_mode = false
 	root.add_child(world)
 	world.start_game()
 	var player: Node = world.player

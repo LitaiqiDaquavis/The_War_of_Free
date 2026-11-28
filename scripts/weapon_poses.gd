@@ -1,6 +1,19 @@
 extends RefCounted
 
 const Timing = preload("res://scripts/attack_timing.gd")
+const SPEAR_SWITCH_TIME: float = 0.3
+
+static func idle_weapon_hand(hand: Vector3, arm_swing: float, kind: String, spear_carry_weight: float) -> Vector3:
+	var swing_weight: float = 1 - spear_carry_weight
+	hand.z += arm_swing * (0.15 if kind == "fists" else 0.08) * swing_weight
+	hand.y += absf(arm_swing) * 0.045 * swing_weight
+	return hand
+
+static func off_hand(arm_swing: float, has_item: bool, guard_weight: float) -> Vector3:
+	var hand := Vector3(-0.31, -0.08, -0.10)
+	hand.z -= arm_swing * (0.10 if has_item else 0.16)
+	hand.y += absf(arm_swing) * 0.04
+	return hand.lerp(Vector3(-0.22, 0.43, -0.35), guard_weight)
 
 # Hand-authored key poses in camera space and in the torso's local space.
 # Interpolation shares the same attack phase in first and third person.
@@ -79,8 +92,8 @@ static func sample(kind: String, phase: float, attacking: bool, reverse_grip: bo
 static func spear_carry() -> Dictionary:
 	var across_chest := Vector3(0.24, 1.32, 0.04)
 	return {
-		"position": Vector3(0.48, -0.42, -0.68),
-		"rotation": across_chest,
+		"position": Vector3(-0.13, -0.51, -0.62),
+		"rotation": Vector3(0.66, 1.36, 0.0),
 		"hand": Vector3(0.19, 0.38, -0.30),
 		"wrist": across_chest
 	}

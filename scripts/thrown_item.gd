@@ -2,6 +2,7 @@ extends RigidBody3D
 
 const Visuals = preload("res://scripts/visuals.gd")
 const Combat = preload("res://scripts/combat.gd")
+var damage_source: Dictionary = {}
 var kind: String = "longsword"
 var shooter: PhysicsBody3D
 var armed: bool = true
@@ -30,6 +31,7 @@ func claim() -> bool:
 	return true
 
 func _ready() -> void:
+	damage_source = Combat.damage_source(shooter, kind)
 	process_mode = Node.PROCESS_MODE_PAUSABLE
 	add_to_group("thrown_items")
 	collision_layer = 8
@@ -96,7 +98,11 @@ func _apply_impact(body: Node, direction: Vector3) -> void:
 	if claimed or not is_inside_tree() or not is_instance_valid(body) or not body.is_inside_tree():
 		return
 	var point: Vector3 = body.get_combat_aim_point()
-	var applied: bool = body.take_melee_hit(point, direction, Combat.MELEE, false)
+	var applied: bool
+	if body.has_method("take_thrown_hit"):
+		applied = body.take_thrown_hit(direction, shooter, damage_source)
+	else:
+		applied = body.take_melee_hit(point, direction, Combat.MELEE, false, shooter, damage_source)
 	if applied and is_instance_valid(shooter) and shooter.has_signal("hit_confirmed"):
 		shooter.last_hit_critical = false
 		shooter.hit_confirmed.emit()

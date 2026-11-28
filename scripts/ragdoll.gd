@@ -12,7 +12,7 @@ var settled: bool = false
 var elapsed: float = 0
 var quiet_time: float = 0
 
-func build(source: Node3D, inherited_velocity: Vector3) -> void:
+func build(source: Node3D, inherited_velocity: Vector3, impact: Vector3 = Vector3.ZERO) -> void:
 	process_mode = Node.PROCESS_MODE_PAUSABLE
 	add_to_group("ragdolls")
 	model = source.duplicate() as Node3D
@@ -62,13 +62,16 @@ func build(source: Node3D, inherited_velocity: Vector3) -> void:
 		_hinge(upper_arm, forearm, elbow_position, bend_axis, -0.65, 0.85)
 	# Disable intra-ragdoll collisions; joints constrain anatomy without initial
 	# armor overlap generating explosive impulses. Terrain and other corpses collide.
+	var fall := Vector3(impact.x, 0, impact.z).normalized()
+	if fall.is_zero_approx():
+		fall = source.global_basis.z
 	for body: RigidBody3D in bodies.values():
 		for other: RigidBody3D in bodies.values():
 			if body != other:
 				body.add_collision_exception_with(other)
-		body.linear_velocity = inherited_velocity + source.global_basis.z * 0.15
-	torso.apply_central_impulse(source.global_basis.z * 5)
-	torso.apply_torque_impulse(source.global_basis.x * 1.25 + source.global_basis.z * 0.12)
+		body.linear_velocity = inherited_velocity + fall * 0.15
+	torso.apply_central_impulse(fall * 5)
+	torso.apply_torque_impulse(Vector3.UP.cross(fall) * 1.25 + fall * 0.12)
 	source.hide()
 
 func _body(id: String, transform: Transform3D, shape: Shape3D, mass: float) -> RigidBody3D:
@@ -77,7 +80,7 @@ func _body(id: String, transform: Transform3D, shape: Shape3D, mass: float) -> R
 	body.mass = mass
 	body.collision_layer = 4
 	body.collision_mask = 13 # terrain + corpses + thrown items; never enemy layer 2
-	# The player shares layer 1 with terrain, so masks alone cannot exclude it.
+	# Explicit exceptions also protect actor/corpse lifecycle transitions.
 	for actor: Node in get_tree().get_nodes_in_group("combat_actors"):
 		body.add_collision_exception_with(actor)
 	body.contact_monitor = true
@@ -150,6 +153,14 @@ func _physics_process(delta: float) -> void:
 	if bodies.is_empty():
 		return
 	elapsed += delta
+	# Sleeping corpses still exist for the full lifetime and remain wakeable.
+	# Avoid rewriting eleven rig transforms every tick once all native bodies sleep.
+	var all_asleep: bool = settled
+	if settled:
+		for body: RigidBody3D in bodies.values():
+			all_asleep = all_asleep and body.sleeping
+	if all_asleep:
+		return
 	_sync_visuals()
 	var quiet: bool = true
 	var supported: bool = false

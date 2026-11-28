@@ -1,5 +1,11 @@
 extends RefCounted
 
+const ARM_LENGTHS := Vector2(0.3, 0.31)
+const BOW_BODY_LATERAL_PULL: float = 0.27
+const BOW_BODY_DEPTH: float = 1.42
+const BOW_RELEASE_TIME: float = 0.1
+const BOW_STRING_TIME: float = 0.15
+
 # Original, low-poly geometry shared by both camera views.
 static func material(color: Color, metal: float = 0.0) -> StandardMaterial3D:
 	var result := StandardMaterial3D.new()
@@ -116,6 +122,66 @@ static func pose_bow(bow: Node3D, draw: float, arrow_visible: bool, nock_progres
 static func bow_nock(draw: float, lateral_pull: float = 1.0) -> Vector3:
 	return Vector3((0.2 + draw * 0.6) * lateral_pull, 0, 0.14 + draw * 0.42)
 
+static func bow_release_draw(t: float) -> float:
+	return lerpf(1.0, 1.12, t / 0.4) if t < 0.4 else lerpf(1.12, 0.0, smoothstep(0.4, 1.0, t))
+
+static func bow_string_draw(t: float) -> float:
+	return sin(t * TAU * 2.0) * 0.12 * (1.0 - t)
+
+static func bow_footing(stance: float, speed: float, draw: float, release_elapsed: float) -> float:
+	var steady: float = clampf(draw, 0.0, 1.0)
+	if release_elapsed < BOW_RELEASE_TIME + BOW_STRING_TIME:
+		steady = 1 - smoothstep(BOW_RELEASE_TIME, BOW_RELEASE_TIME + BOW_STRING_TIME, release_elapsed)
+	# Keep the left foot leading at full draw while retaining a short moving step.
+	return stance * lerpf(1.0, 0.8 * steady, smoothstep(0.08, 3.0, speed))
+
+static func pose_bow_stance(model: Node3D, stance: float, aim_pitch: float, footing: float, prone_blend: float = 0.0) -> void:
+	var upper: Node3D = model.get_node("Upper")
+	upper.rotation.y = -0.98 * stance
+	var helmet: Node3D = upper.get_node("Helmet")
+	helmet.rotation.y = -upper.rotation.y
+	helmet.rotation.x = PI / 2 * prone_blend + clampf(aim_pitch, -0.92, 0.92) * stance * (1 - prone_blend)
+	if footing <= 0:
+		return
+	var left_leg: Node3D = model.get_node("LeftLeg")
+	var right_leg: Node3D = model.get_node("RightLeg")
+	left_leg.rotation.x = lerpf(left_leg.rotation.x, 0.28, footing)
+	right_leg.rotation.x = lerpf(right_leg.rotation.x, -0.25, footing)
+	left_leg.get_node("Knee").rotation.x = lerpf(left_leg.get_node("Knee").rotation.x, 0.08, footing)
+	right_leg.get_node("Knee").rotation.x = lerpf(right_leg.get_node("Knee").rotation.x, 0.04, footing)
+	model.position.y -= 0.026 * footing
+
+static func pose_body_bow(bow: Node3D, stance: float, aim_pitch: float, draw: float, arrow_visible: bool, nock_progress: float, arm_swing: float, use_draw_hand: bool = true) -> void:
+	# One hand carries the lowered bow. The other only moves to the string on raising it.
+	var left_arm: Node3D = bow.get_parent().get_parent()
+	var upper: Node3D = left_arm.get_parent()
+	var pitch: float = clampf(aim_pitch, -0.92, 0.92)
+	var aim_pivot := Vector3(-0.10, 0.52, -0.22)
+	var aim_grip: Vector3 = aim_pivot + Basis(Vector3.RIGHT, pitch) * (Vector3(-0.088, 0.75, -0.84) - aim_pivot)
+	var lowered_grip := Vector3(-0.40, -0.05 + absf(arm_swing) * 0.035, -0.17 - arm_swing * 0.10)
+	var grip: Vector3 = lowered_grip.lerp(aim_grip, stance)
+	var rotation_model: Vector3 = Vector3(0.32 + arm_swing * 0.11, 0.05, 0.12).lerp(Vector3(pitch, 0, 0), stance)
+	var upper_inverse: Basis = upper.basis.inverse()
+	var wrist: Vector3 = (upper_inverse * Basis.from_euler(rotation_model)).get_euler()
+	var left_target: Vector3 = upper_inverse * grip
+	var reach_fraction: float = lerpf(0.985, 0.9999, stance)
+	var arm_extension: float = maxf(1.0, left_arm.position.distance_to(left_target) / ((ARM_LENGTHS.x + ARM_LENGTHS.y) * reach_fraction))
+	pose_arm(left_arm, left_target, wrist, -1.0, ARM_LENGTHS * arm_extension, upper_inverse * Vector3(-0.25, -1, 0.35), 1.0, reach_fraction)
+	bow.scale = Vector3(1, 1, BOW_BODY_DEPTH)
+	pose_bow(bow, draw, arrow_visible, nock_progress, BOW_BODY_LATERAL_PULL)
+	bow.get_node("DrawHand").hide()
+	if not use_draw_hand:
+		return
+	var right_arm: Node3D = upper.get_node("RightArm")
+	var nock_offset: Vector3 = Vector3(0.10, -0.25, 0.20) * (1 - nock_progress)
+	var fingers: Vector3 = bow_nock(draw, BOW_BODY_LATERAL_PULL) + nock_offset + Vector3(0.025, 0.012, 0.028)
+	var string_hand: Vector3 = upper.to_local(bow.to_global(fingers))
+	var free_hand := Vector3(0.31, -0.08 + absf(arm_swing) * 0.04, -0.10 + arm_swing * 0.16)
+	var draw_grip: Vector3 = (upper_inverse * free_hand).lerp(string_hand, stance)
+	var draw_elbow: Vector3 = Vector3(0.12, -1.0, 0.65).lerp(Vector3(0.82, 0.43, 1.0), clampf(draw, 0, 1) * stance)
+	var draw_wrist: Vector3 = Vector3.ZERO.lerp(wrist.lerp(Vector3(0, 1.15, -0.18), draw), stance)
+	pose_arm(right_arm, draw_grip, draw_wrist, 1.0, ARM_LENGTHS, upper_inverse * draw_elbow)
+
 static func gauntlet() -> Node3D:
 	var root := Node3D.new()
 	var leather := material(Color("604030"))
@@ -146,6 +212,9 @@ static func pose_view_forearm(arm: Node3D, from: Vector3, to: Vector3) -> void:
 	plate.quaternion = Quaternion(Vector3.UP, (to - from).normalized())
 	plate.scale = Vector3(1, minf(from.distance_to(to) * 0.62, 0.28) / 0.18, 1)
 	arm.set_meta("entry", to)
+
+static func pose_weapon_arm(arm: Node3D, target: Vector3, wrist: Vector3, side: float) -> void:
+	pose_arm(arm, target, wrist, side, ARM_LENGTHS, Vector3(side * 0.12, -1, 0.65))
 
 static func pose_arm(arm: Node3D, target: Vector3, wrist: Vector3, side: float, lengths: Vector2 = Vector2(0.3, 0.31), pole_hint: Vector3 = Vector3.ZERO, width: float = 1.0, reach_fraction: float = 0.985) -> void:
 	# Analytic two-link elbow. The wrist is specified in torso coordinates.

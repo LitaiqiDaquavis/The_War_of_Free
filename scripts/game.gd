@@ -17,6 +17,19 @@ const DEFAULT_KEYS: Dictionary = {
 }
 const MAIN_WEAPONS: Dictionary = {"fists": "Fists", "dagger": "Dagger", "longsword": "Longsword", "spear": "Spear", "mace": "Mace"}
 const OFF_WEAPONS: Dictionary = {"bow": "Bow", "shield": "Shield"}
+const HealthRing = preload("res://scripts/health_ring.gd")
+const Combat = preload("res://scripts/combat.gd")
+var health_ring: Control
+const DamageIndicator = preload("res://scripts/damage_indicator.gd")
+const DeathReplay = preload("res://scripts/death_replay.gd")
+var death_replay: Node3D
+const KillFeed = preload("res://scripts/kill_feed.gd")
+var kill_feed: Control
+var kill_feed_layer: CanvasLayer
+var damage_indicator: Control
+
+const Soldier = preload("res://scripts/soldier.gd")
+const Battlefield = preload("res://scripts/battlefield.gd")
 const Dummy = preload("res://scripts/dummy.gd")
 const LoadoutMenu = preload("res://scripts/loadout_menu.gd")
 
@@ -40,9 +53,14 @@ var off_hand: String = "shield"
 var hit_timer: float = 0
 var hit_total: int = 0
 var match_number: int = 0
-var attack_status: Label
-var health_text: Label
-var blocked_timer: float = 0
+var battle_mode: bool = true
+var battlefield: Node3D
+var soldiers: Array[Node] = []
+var respawn_timers: Dictionary = {}
+var battle_deaths: int = 0
+var battle_respawns: int = 0
+var team_scores := [0, 0]
+var score_label: Label
 var training_mode: bool = false
 var round_generation: int = 0
 var enemy_respawn_generation: int = -1
@@ -60,22 +78,60 @@ func _ready() -> void:
 	_load_settings()
 	player.equip(main_hand, off_hand)
 	player.hit_confirmed.connect(_on_hit)
-	player.equipment_changed.connect(_update_hud)
 	player.death_finished.connect(show_death_menu)
 	player.death_started.connect(_on_death_started)
-	player.health_changed.connect(_update_health)
-	player.shield_blocked.connect(func() -> void: blocked_timer = 0.3)
-	var enemy := Dummy.new()
-	enemy.name = "TrainingEnemy"
-	enemy.ai_enabled = not training_mode
-	enemy.invulnerable = training_mode
-	enemy.target = player
-	add_child(enemy)
-	enemy.defeated_started.connect(_on_enemy_defeated)
+	player.fell_out_of_bounds.connect(_place_player)
+	if battle_mode and not training_mode:
+		battlefield = Battlefield.new()
+		add_child(battlefield)
+		battlefield.build()
+		_build_scoreboard()
+		for team: int in range(2):
+			for index: int in range(19 if team == 0 else 20):
+				var soldier := Soldier.new()
+				soldier.team_id = team
+				soldier.slot = index + (1 if team == 0 else 0)
+				soldier.role = "archer" if index < 10 else "melee"
+				soldier.weapon = ["longsword", "spear", "mace", "dagger"][index % 4]
+				soldier.has_shield = soldier.role == "melee" and index % 2 == 0
+				soldier.name = "TrainingEnemy" if team == 1 and index == 0 else "Soldier_%d_%d" % [team, index]
+				soldier.transform = battlefield.get_spawn_transform(team, soldier.slot)
+				add_child(soldier)
+				soldier.spawn_transform = battlefield.get_spawn_transform(team, soldier.slot)
+				soldier.transform = soldier.spawn_transform
+				soldiers.append(soldier)
+				soldier.defeated_started.connect(_on_soldier_defeated.bind(soldier))
+	else:
+		var enemy := Dummy.new()
+		enemy.name = "TrainingEnemy"
+		enemy.ai_enabled = not training_mode
+		enemy.invulnerable = training_mode
+		enemy.target = player
+		add_child(enemy)
+		enemy.defeated_started.connect(_on_enemy_defeated)
 	apply_graphics()
+	health_ring = HealthRing.new()
+	health_ring.name = "HealthRing"
+	hud.add_child(health_ring)
+	health_ring.position = Vector2(22, 22)
+	health_ring.size = Vector2(106, 106)
+	player.health_changed.connect(func() -> void: health_ring.set_health(player.health))
+	health_ring.set_health(player.health)
+	damage_indicator = DamageIndicator.new()
+	damage_indicator.name = "DamageIndicator"
+	damage_indicator.camera = player.camera
+	hud.add_child(damage_indicator)
+	damage_indicator.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	player.damage_received.connect(damage_indicator.add_hit)
+	player.shield_blocked.connect(damage_indicator.add_block)
+	kill_feed_layer = CanvasLayer.new()
+	kill_feed_layer.layer = 2
+	add_child(kill_feed_layer)
+	kill_feed = KillFeed.new()
+	kill_feed.name = "KillFeed"
+	kill_feed_layer.add_child(kill_feed)
 	_build_shell()
 	show_main_menu()
-	_update_health()
 
 func key_for(action: String) -> int:
 	var events: Array[InputEvent] = InputMap.action_get_events(action)
@@ -176,39 +232,6 @@ func _build_shell() -> void:
 		save_settings())
 	loadout_menu.start_requested.connect(start_game)
 	loadout_menu.back_requested.connect(show_main_menu)
-	attack_status = Label.new()
-	attack_status.name = "AttackStatus"
-	attack_status.set_anchors_and_offsets_preset(Control.PRESET_CENTER_BOTTOM)
-	attack_status.offset_left = -320
-	attack_status.offset_right = 320
-	attack_status.offset_top = -82
-	attack_status.offset_bottom = -38
-	attack_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	attack_status.add_theme_font_size_override("font_size", 17)
-	attack_status.add_theme_color_override("font_color", Color("e5ba7c"))
-	attack_status.add_theme_color_override("font_shadow_color", Color.BLACK)
-	attack_status.add_theme_constant_override("shadow_offset_x", 1)
-	attack_status.add_theme_constant_override("shadow_offset_y", 2)
-	attack_status.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(attack_status)
-	health_text = Label.new()
-	health_text.name = "Health"
-	health_text.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_LEFT)
-	health_text.offset_left = 24
-	health_text.offset_right = 300
-	health_text.offset_top = -64
-	health_text.offset_bottom = -20
-	health_text.add_theme_font_size_override("font_size", 24)
-	health_text.add_theme_color_override("font_shadow_color", Color.BLACK)
-	health_text.add_theme_constant_override("shadow_offset_x", 1)
-	health_text.add_theme_constant_override("shadow_offset_y", 2)
-	hud.add_child(health_text)
-
-func _update_health() -> void:
-	if is_instance_valid(health_text):
-		health_text.text = "HEALTH  %d / 100" % player.health
-		health_text.modulate = Color("ff8686") if player.health <= 40 else Color.WHITE
-
 func _clear(title: String, subtitle: String) -> void:
 	loadout_menu.hide()
 	menu_center.show()
@@ -218,7 +241,7 @@ func _clear(title: String, subtitle: String) -> void:
 	for child: Node in content.get_children():
 		content.remove_child(child)
 		child.queue_free()
-	_label("THE WAR OF FREE", 15, Color("8ec8b0"))
+	_label("The War of Freedom", 15, Color("8ec8b0"))
 	_label(title, 36)
 	_label(subtitle, 16, Color("a7bbc6"))
 	content.add_child(HSeparator.new())
@@ -248,7 +271,7 @@ func show_main_menu() -> void:
 	get_tree().paused = true
 	hud.hide()
 	overlay.show()
-	_clear("The proving ground", "Choose your weapons. Face an enemy soldier.")
+	_clear("The proving ground", "Choose your weapons. Fight alongside the blue army." if battle_mode else "Choose your weapons. Face an enemy soldier.")
 	play_button = _button("Play", show_loadout)
 	_button("Controls", show_controls)
 	_button("Graphics", show_graphics)
@@ -281,8 +304,14 @@ func _restore_time() -> void:
 	Engine.time_scale = 1.0
 	death_real_remaining = 0
 	player.death_closeup = false
+	if is_instance_valid(death_replay):
+		death_replay.close()
+		remove_child(death_replay)
+		death_replay.queue_free()
+		death_replay = null
 
-func _on_enemy_defeated() -> void:
+func _on_enemy_defeated(_attacker: Node) -> void:
+	_report_kill(get_node("TrainingEnemy"))
 	if training_mode or not game_started:
 		return
 	enemy_respawn_generation = round_generation
@@ -301,6 +330,7 @@ func _respawn_enemy() -> void:
 func respawn_player() -> void:
 	if player.is_alive or not game_started:
 		return
+	damage_indicator.clear()
 	_restore_time()
 	if is_instance_valid(player.ragdoll):
 		# Keep old corpse until its original real-time deadline (not another 20s).
@@ -308,10 +338,13 @@ func respawn_player() -> void:
 		player.ragdoll = null
 	player.reset_for_match()
 	player.equip(main_hand, off_hand)
+	_place_player()
 	respawn_click_ready = false
 	start_game()
 
 func reset_round() -> void:
+	kill_feed.clear()
+	damage_indicator.clear()
 	round_generation += 1
 	enemy_respawn_remaining = -1
 	enemy_respawn_generation = -1
@@ -325,12 +358,19 @@ func reset_round() -> void:
 	for item: Node in get_tree().get_nodes_in_group("thrown_items"):
 		item.get_parent().remove_child(item)
 		item.queue_free()
-	get_node("TrainingEnemy").reset_for_match()
+	respawn_timers.clear()
+	team_scores = [0, 0]
+	_update_scoreboard()
+	if not soldiers.is_empty():
+		for soldier: Node in soldiers:
+			soldier.reset_for_match()
+	else:
+		get_node("TrainingEnemy").reset_for_match()
+	_place_player()
 	for corpse: Node in get_tree().get_nodes_in_group("ragdolls"):
 		corpse.dispose()
 	hit_total = 0
 	hit_timer = 0
-	blocked_timer = 0
 	$HUD/Crosshair.text = "+"
 	$HUD/Crosshair.modulate = Color.WHITE
 
@@ -344,7 +384,9 @@ func suicide() -> void:
 		return
 	player.die()
 
-func _on_death_started() -> void:
+func _on_death_started(attacker: Node) -> void:
+	_report_kill(player)
+	_score_defeat(player, attacker)
 	screen = "dying"
 	hud.hide()
 	overlay.hide()
@@ -353,6 +395,10 @@ func _on_death_started() -> void:
 	# A held attack cannot become a respawn. Require release then a fresh press.
 	respawn_click_ready = not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	death_real_remaining = 1.2
+	if not player.death_record.is_empty():
+		death_replay = DeathReplay.new()
+		add_child(death_replay)
+		death_real_remaining = death_replay.begin(player, attacker, player.death_record)
 	Engine.time_scale = 0.2
 
 func show_death_menu() -> void:
@@ -368,7 +414,7 @@ func show_loadout() -> void:
 	hud.hide()
 	overlay.show()
 	menu_center.hide()
-	loadout_menu.present(main_hand, off_hand, key_name("throw_knife"), key_name("kick"), key_name("flip_dagger"))
+	loadout_menu.present(main_hand, off_hand)
 
 func start_game() -> void:
 	if not game_started:
@@ -384,17 +430,6 @@ func start_game() -> void:
 	hud.show()
 	get_tree().paused = false
 	player.set_controls_active(true)
-	_update_hud()
-
-func _update_hud() -> void:
-	if not is_instance_valid(hud):
-		return
-	var equipped: String = MAIN_WEAPONS[player.main_hand]
-	if player.main_hand == "dagger" and player.dagger_reverse:
-		equipped += " (Reverse grip)"
-	if player.active_slot == 2 and not player.off_dropped:
-		equipped = "Bow" if player.off_hand == "bow" else equipped + " + Shield"
-	$HUD/Instructions.text = "THE WAR OF FREE  |  %s\n%s %s %s %s Move  |  %s Sprint  |  %s Jump  |  %s Camera\n%s Main hand  |  %s Off hand  |  LMB Melee / Shield bash / Shoot\nRMB Shield / 2x zoom  |  %s Knife  |  %s Kick  |  %s Throw item  |  %s Prone  |  Esc Pause" % [equipped, key_name("move_forward"), key_name("move_left"), key_name("move_back"), key_name("move_right"), key_name("sprint"), key_name("jump"), key_name("toggle_view"), key_name("main_slot"), key_name("off_slot"), key_name("throw_knife"), key_name("kick"), key_name("throw_item"), key_name("prone")]
 
 func _on_hit() -> void:
 	hit_timer = 0.35 if player.last_hit_critical else 0.2
@@ -403,7 +438,9 @@ func _on_hit() -> void:
 	$HUD/Crosshair.modulate = Color("e5ba7c") if player.last_hit_critical else Color("ff7777")
 
 func _process(delta: float) -> void:
+	kill_feed_layer.visible = game_started and screen in ["game", "dying", "dead"]
 	if game_started and not get_tree().paused:
+		_tick_battle_respawns(delta / maxf(Engine.time_scale, 0.001))
 		var real_delta: float = delta / maxf(Engine.time_scale, 0.001)
 		if enemy_respawn_remaining >= 0:
 			enemy_respawn_remaining -= real_delta
@@ -411,6 +448,8 @@ func _process(delta: float) -> void:
 				enemy_respawn_remaining = -1
 				_respawn_enemy()
 		if death_real_remaining > 0:
+			if is_instance_valid(death_replay):
+				death_replay.advance(real_delta)
 			death_real_remaining = maxf(0, death_real_remaining - real_delta)
 			if death_real_remaining <= 0:
 				_restore_time()
@@ -418,25 +457,6 @@ func _process(delta: float) -> void:
 	if screen != "game":
 		return
 	hit_timer = maxf(0, hit_timer - delta)
-	blocked_timer = maxf(0, blocked_timer - delta)
-	attack_status.text = ""
-	var pickup: Node = player.get_pickup_target()
-	if is_instance_valid(pickup):
-		var item_name: String = "Shield" if pickup.kind == "shield" else MAIN_WEAPONS[pickup.kind]
-		var slot_name: String = "off hand" if pickup.kind == "shield" else "main hand"
-		attack_status.text = "%s  Pick up %s  |  Replace %s" % [key_name("flip_dagger"), item_name, slot_name] if player.can_pickup() else "Finish action to pick up " + item_name
-	elif blocked_timer > 0:
-		attack_status.text = "BLOCKED"
-	elif get_node("TrainingEnemy").defeated:
-		attack_status.text = "ENEMY DEFEATED"
-	elif hit_timer > 0 and player.last_hit_critical:
-		attack_status.text = "CRITICAL HIT"
-	elif player.bow_active() and player.sprinting:
-		attack_status.text = "Stop sprinting to ready the bow"
-	elif player.bow_active() and not player.bow_ready() and player.special_action.is_empty():
-		attack_status.text = player.bow_status()
-	elif player.main_hand == "dagger" and not player.bow_active():
-		attack_status.text = "%s  Flip grip  |  %s" % [key_name("flip_dagger"), "Reverse: downward stab" if player.dagger_reverse else "Normal: slash"]
 	if hit_timer == 0:
 		$HUD/Crosshair.text = "+"
 		$HUD/Crosshair.modulate = Color.WHITE
@@ -573,3 +593,60 @@ func _notification(what: int) -> void:
 
 func _exit_tree() -> void:
 	Engine.time_scale = 1.0
+
+func _place_player() -> void:
+	if is_instance_valid(battlefield):
+		player.transform = Combat.free_spawn(player, battlefield.get_spawn_transform(player.team_id, 0))
+	else:
+		player.position = player.SPAWN_POSITION
+
+func _build_scoreboard() -> void:
+	score_label = Label.new()
+	score_label.name = "TeamScore"
+	hud.add_child(score_label)
+	score_label.set_anchors_and_offsets_preset(Control.PRESET_CENTER_TOP)
+	score_label.offset_left = -184
+	score_label.offset_right = 184
+	score_label.offset_top = 18
+	score_label.offset_bottom = 52
+	score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	score_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	score_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	score_label.add_theme_font_size_override("font_size", 22)
+	score_label.add_theme_color_override("font_outline_color", Color(0.04, 0.05, 0.07, 0.95))
+	score_label.add_theme_constant_override("outline_size", 6)
+	_update_scoreboard()
+
+func _update_scoreboard() -> void:
+	if is_instance_valid(score_label):
+		score_label.text = "BLUE  %d    |    %d  RED" % team_scores
+
+func _score_defeat(victim: Node, attacker: Node) -> void:
+	if not game_started or not is_instance_valid(score_label) or not is_instance_valid(attacker):
+		return
+	var team: Variant = attacker.get("team_id")
+	var victim_team: Variant = victim.get("team_id")
+	if team not in [0, 1] or victim_team not in [0, 1] or team == victim_team:
+		return
+	team_scores[team] += 1
+	_update_scoreboard()
+
+func _on_soldier_defeated(attacker: Node, soldier: Node) -> void:
+	_report_kill(soldier)
+	_score_defeat(soldier, attacker)
+	battle_deaths += 1
+	respawn_timers[soldier] = 2.0
+
+func _tick_battle_respawns(real_delta: float) -> void:
+	for soldier: Node in respawn_timers.keys():
+		respawn_timers[soldier] -= real_delta
+		if respawn_timers[soldier] <= 0:
+			# Old body remains independently owned, with original 20 s lifetime.
+			soldier.ragdoll = null
+			soldier.reset_for_match()
+			respawn_timers.erase(soldier)
+			battle_respawns += 1
+
+func _report_kill(victim: Node) -> void:
+	if game_started and not training_mode and is_instance_valid(kill_feed):
+		kill_feed.add_kill(victim.lethal_source, Combat.actor_identity(victim))

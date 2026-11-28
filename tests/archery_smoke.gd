@@ -2,8 +2,10 @@ extends SceneTree
 
 const Timing = preload("res://scripts/attack_timing.gd")
 var failures: Array[String] = []
+var checks: int = 0
 
 func check(ok: bool, message: String) -> void:
+	checks += 1
 	if not ok:
 		failures.append(message)
 		push_error(message)
@@ -21,6 +23,7 @@ func run() -> void:
 	var world: Node = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "res://tests/archery-smoke-settings.cfg"
 	world.training_mode = true
+	world.battle_mode = false
 	root.add_child(world)
 	world.start_game()
 	var player: Node = world.player
@@ -65,16 +68,25 @@ func run() -> void:
 	Input.action_press("sprint")
 	for index in range(12):
 		player._physics_process(1.0 / 60.0)
-	check(player.sprinting and not player.bow_ready(), "Forward sprint must put the bow into two-handed carry.")
+	check(player.sprinting and player.bow_ready(), "A ready bow stays drawn while sprinting.")
+	check(player.off_mount.get_child(0).get_node("NockedArrow").visible, "A nocked arrow remains visible while sprinting.")
+	# This point in the regular run cycle would put the right leg forward.
+	player.gait_phase = PI * 0.5
+	player._animate_locomotion(0)
+	var left_leg: Node3D = player.body_model.get_node("LeftLeg")
+	var right_leg: Node3D = player.body_model.get_node("RightLeg")
+	check(left_leg.rotation.x > 0 and right_leg.rotation.x < 0, "Full draw keeps the left foot forward even during the opposite stride.")
 	left_click(player, true)
 	left_click(player, false)
-	check(get_nodes_in_group("arrows").size() == 2, "Sprinting with a carried bow must not fire.")
+	check(get_nodes_in_group("arrows").size() == 3 and not player.bow_ready(), "A moving archer releases the arrow immediately.")
+	player._tick_bow(0.08)
+	player._animate_locomotion(0)
+	check(left_leg.rotation.x > 0 and right_leg.rotation.x < 0, "The left foot stays forward through release.")
+	player._tick_bow(0.57)
 	Input.action_release("move_forward")
 	Input.action_release("sprint")
-	player._physics_process(0.425)
-	check(not player.sprinting and not player.bow_ready(), "Leaving sprint must start a fresh draw.")
-	player._physics_process(0.425)
-	check(player.bow_ready(), "The bow must be ready 0.85s after leaving sprint.")
+	player._physics_process(0.50)
+	check(not player.sprinting and player.bow_ready(), "Stopping movement must preserve time already spent reloading.")
 
 	player.select_slot(1)
 	player.position = Vector3(0, 0, 2.7)
@@ -105,4 +117,5 @@ func run() -> void:
 
 	if failures.is_empty():
 		print("ARCHERY_SMOKE: PASS")
+	print("ASSERTION_TOTAL: ", checks, " checks, ", failures.size(), " failures")
 	quit(0 if failures.is_empty() else 1)

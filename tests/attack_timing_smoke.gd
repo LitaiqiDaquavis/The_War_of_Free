@@ -2,8 +2,10 @@ extends SceneTree
 
 const Timing = preload("res://scripts/attack_timing.gd")
 var failures: Array[String] = []
+var checks: int = 0
 
 func check(ok: bool, message: String) -> void:
+	checks += 1
 	if not ok:
 		failures.append(message)
 		push_error(message)
@@ -37,6 +39,7 @@ func run() -> void:
 	var world: Node = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "res://tests/timing-settings.cfg"
 	world.training_mode = true
+	world.battle_mode = false
 	root.add_child(world)
 	var player: Node = world.player
 	var enemy: Node = world.get_node("TrainingEnemy")
@@ -167,4 +170,5 @@ func run() -> void:
 	paused = false
 	await process_frame
 	print("ATTACK_TIMING_SMOKE: ", "PASS" if failures.is_empty() else "FAIL")
+	print("ASSERTION_TOTAL: ", checks, " checks, ", failures.size(), " failures")
 	quit(0 if failures.is_empty() else 1)

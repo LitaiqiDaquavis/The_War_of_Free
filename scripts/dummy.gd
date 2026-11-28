@@ -1,6 +1,6 @@
 extends CharacterBody3D
 
-signal defeated_started
+signal defeated_started(attacker: Node)
 
 const Visuals = preload("res://scripts/visuals.gd")
 const Ragdoll = preload("res://scripts/ragdoll.gd")
@@ -8,7 +8,10 @@ const Combat = preload("res://scripts/combat.gd")
 const Poses = preload("res://scripts/weapon_poses.gd")
 const Timing = preload("res://scripts/attack_timing.gd")
 var spawn_transform: Transform3D
-var health: int = Combat.MAX_HEALTH
+var lethal_source: Dictionary = {}
+var health: float = Combat.MAX_HEALTH
+var regen_elapsed: float = 0
+var struck_ids: Dictionary = {}
 var ai_enabled: bool = true
 var invulnerable: bool = false
 var target: Node3D
@@ -33,10 +36,11 @@ var ragdoll: Node3D
 var last_melee_damage: float = 0
 var last_melee_critical: bool = false
 
-func defeat() -> void:
+func defeat(attacker: Node = null) -> void:
 	if defeated:
 		return
 	defeated = true
+	struck_ids.clear()
 	health = 0
 	health_label.text = "ENEMY DEFEATED"
 	health_label.modulate = Color("b7c2c6")
@@ -50,9 +54,10 @@ func defeat() -> void:
 	ragdoll.build(model, velocity * 0.35)
 	velocity = Vector3.ZERO
 	set_physics_process(true)
-	defeated_started.emit()
+	defeated_started.emit(attacker)
 
 func _physics_process(delta: float) -> void:
+	Combat.regen_tick(self, delta)
 	if defeated:
 		death_elapsed += delta
 		if is_instance_valid(ragdoll) and ragdoll.settled:
@@ -85,13 +90,14 @@ func _physics_process(delta: float) -> void:
 		if attack_elapsed >= 0:
 			attack_elapsed += delta
 			if attack_pending and Timing.stage("longsword", attack_elapsed) == "active":
-				if _strike_target():
+				if _strike_target() and not Combat.uses_aoe("longsword"):
 					attack_pending = false
 			if Timing.stage("longsword", attack_elapsed) == "done":
 				attack_elapsed = -1
 				attack_cooldown = 0
 		elif distance < 1.85 and attack_cooldown == 0 and _can_see_target():
 			attack_elapsed = 0
+			struck_ids.clear()
 			attack_pending = true
 		elif distance < 45:
 			if distance > 1.55:
@@ -117,21 +123,7 @@ func _can_see_target() -> bool:
 func _strike_target() -> bool:
 	if attack_elapsed < 0 or not attack_pending or Timing.stage("longsword", attack_elapsed) != "active":
 		return false
-	var origin: Vector3 = global_position + Vector3.UP * 1.25
-	var direction: Vector3 = (target.get_combat_aim_point() - origin).normalized()
-	var facing: Vector3 = -global_basis.z
-	var flat: Vector3 = target.global_position - global_position
-	flat.y = 0
-	if facing.dot(flat.normalized()) < 0.55:
-		return false
-	var query := PhysicsRayQueryParameters3D.create(origin, origin + direction * 2.1, 3, [get_rid()])
-	var hit: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
-	if not hit.is_empty():
-		attack_pending = false
-	if not hit.is_empty() and hit.collider == target:
-		target.take_melee_hit(hit.position, direction, Combat.MELEE, false)
-		return true
-	return not hit.is_empty()
+	return Combat.sweep(self, get_combat_aim_point(), -global_basis.z, 2.1, Combat.MELEE, false, struck_ids) > 0
 
 func _animate_fighter(delta: float) -> void:
 	var speed: float = Vector2(velocity.x, velocity.z).length()
@@ -146,6 +138,7 @@ func _animate_fighter(delta: float) -> void:
 	Visuals.pose_arm(upper.get_node("LeftArm"), Vector3(-0.36, 0.07, -0.14), Vector3.ZERO, -1.0)
 
 func reset_for_match() -> void:
+	lethal_source.clear()
 	if is_instance_valid(ragdoll):
 		ragdoll.dispose()
 		ragdoll = null
@@ -157,7 +150,9 @@ func reset_for_match() -> void:
 	active_bursts = 0
 	defeated = false
 	health = Combat.MAX_HEALTH
-	transform = spawn_transform
+	regen_elapsed = 0
+	struck_ids.clear()
+	transform = Combat.free_spawn(self, spawn_transform)
 	velocity = Vector3.ZERO
 	attack_elapsed = -1
 	attack_pending = false
@@ -169,7 +164,7 @@ func reset_for_match() -> void:
 	for name: String in ["LeftLeg", "RightLeg"]:
 		model.get_node(name).rotation = Vector3.ZERO
 		model.get_node(name + "/Knee").rotation = Vector3.ZERO
-	set_physics_process(ai_enabled)
+	set_physics_process(true)
 	if reaction and reaction.is_valid():
 		reaction.kill()
 	upper.rotation = Vector3.ZERO
@@ -184,10 +179,10 @@ func reset_for_match() -> void:
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_PAUSABLE
 	add_to_group("combat_actors")
-	set_physics_process(ai_enabled)
+	set_physics_process(true)
 	rng.randomize()
 	collision_layer = 2
-	collision_mask = 1
+	collision_mask = 3
 	var shape := CapsuleShape3D.new()
 	shape.radius = 0.38
 	shape.height = 1.95
@@ -204,6 +199,8 @@ func _ready() -> void:
 	if ai_enabled:
 		upper.get_node("RightArm/Hand").add_child(Visuals.weapon("longsword"))
 	var label := Label3D.new()
+	# Retain diagnostic state for lifecycle tests, never render combat text.
+	label.visible = false
 	health_label = label
 	label.position.y = 2.15
 	label.font_size = 24
@@ -223,36 +220,39 @@ func get_head_position() -> Vector3:
 func get_combat_aim_point() -> Vector3:
 	return global_position + Vector3.UP * 1.15
 
-func take_projectile_hit(point: Vector3, direction: Vector3, kind: String) -> bool:
-	return _receive_hit(Combat.projectile_damage(kind, Combat.is_head_hit(self, point)), point, direction)
+func take_projectile_hit(point: Vector3, direction: Vector3, kind: String, attacker: Node = null, source: Dictionary = {}) -> bool:
+	return _receive_hit(Combat.projectile_damage(kind, Combat.is_head_hit(self, point)), point, direction, 1.0, true, attacker, source if not source.is_empty() else Combat.damage_source(attacker, kind))
 
-func take_kick(point: Vector3, direction: Vector3) -> bool:
-	return _receive_hit(Combat.KICK, point, direction, 1.65, false)
+func take_kick(point: Vector3, direction: Vector3, attacker: Node = null) -> bool:
+	return _receive_hit(Combat.KICK, point, direction, 1.65, false, attacker, Combat.damage_source(attacker, "kick"))
 
-func take_shield_hit(point: Vector3, direction: Vector3) -> bool:
+func take_shield_hit(point: Vector3, direction: Vector3, attacker: Node = null) -> bool:
 	last_melee_damage = Combat.SHIELD
 	last_melee_critical = false
-	return _receive_hit(Combat.SHIELD, point, direction, 1.4, false)
+	return _receive_hit(Combat.SHIELD, point, direction, 1.4, false, attacker, Combat.damage_source(attacker, "shield"))
 
-func take_melee_hit(point: Vector3, direction: Vector3, damage: float, critical: bool) -> bool:
+func take_melee_hit(point: Vector3, direction: Vector3, damage: float, critical: bool, attacker: Node = null, source: Dictionary = {}) -> bool:
 	if defeated:
 		return false
 	last_melee_damage = damage
 	last_melee_critical = critical
-	return _receive_hit(damage, point, direction, 1.7 if critical else 1.0)
+	return _receive_hit(damage, point, direction, 1.7 if critical else 1.0, true, attacker, source)
 
 func take_hit(point: Vector3, direction: Vector3, strength: float = 1.0, bleed: bool = true) -> bool:
 	return _receive_hit(Combat.MELEE, point, direction, strength, bleed)
 
-func _receive_hit(damage: float, point: Vector3, direction: Vector3, strength: float = 1.0, bleed: bool = true) -> bool:
+func _receive_hit(damage: float, point: Vector3, direction: Vector3, strength: float = 1.0, bleed: bool = true, attacker: Node = null, source: Dictionary = {}) -> bool:
 	if defeated:
 		return false
 	hit_count += 1
 	if not invulnerable:
-		health = maxi(0, health - int(damage))
+		health = maxf(0, health - damage)
+		if damage > 0:
+			regen_elapsed = 0
 	stagger_timer = 0.2
 	attack_elapsed = -1
 	attack_pending = false
+	struck_ids.clear()
 	attack_cooldown = maxf(0.45, attack_cooldown)
 	if reaction and reaction.is_valid():
 		reaction.kill()
@@ -265,7 +265,8 @@ func _receive_hit(damage: float, point: Vector3, direction: Vector3, strength: f
 		_blood(point, direction)
 	_update_health_label()
 	if health <= 0:
-		defeat()
+		lethal_source = source.duplicate(true) if not source.is_empty() else Combat.damage_source(attacker)
+		defeat(attacker)
 	return true
 
 func _blood(point: Vector3, direction: Vector3) -> void:

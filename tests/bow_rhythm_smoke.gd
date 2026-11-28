@@ -57,6 +57,7 @@ func run() -> void:
 	var world: Node = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "user://bow-rhythm-smoke.cfg"
 	world.training_mode = true
+	world.battle_mode = false
 	root.add_child(world)
 	world.start_game()
 	var player: Node = world.player
@@ -117,10 +118,8 @@ func run() -> void:
 		check(player.bow_ready() and arrows() == before, "weapon reselect no queued shot")
 
 	# All interruptions discard feedback/draw and require full equipment again.
-	for action in ["sprint", "special", "controls"]:
-		if action == "sprint":
-			player.sprinting = true
-		elif action == "special":
+	for action in ["special", "controls"]:
+		if action == "special":
 			player._begin_special("kick")
 		else:
 			player.set_controls_active(false)
@@ -128,7 +127,6 @@ func run() -> void:
 		player._tick_bow(10)
 		click(player)
 		check(not player.bow_ready() and arrows() == before, action + ": interruption cannot fire or advance preparation")
-		player.sprinting = false
 		player.cancel_special()
 		player.set_controls_active(true)
 		player._tick_bow(0.84999)

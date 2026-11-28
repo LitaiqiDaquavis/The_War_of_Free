@@ -2,8 +2,10 @@ extends SceneTree
 
 const Thrown = preload("res://scripts/thrown_item.gd")
 var failures: Array[String] = []
+var checks: int = 0
 
 func check(ok: bool, message: String) -> void:
+	checks += 1
 	if not ok:
 		failures.append(message)
 		push_error(message)
@@ -53,6 +55,7 @@ func run() -> void:
 	var world: Node = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "res://tests/pickup-settings.cfg"
 	world.training_mode = true
+	world.battle_mode = false
 	root.add_child(world)
 	var player: Node = world.player
 	for kind: String in ["dagger", "longsword", "spear", "mace"]:
@@ -66,7 +69,7 @@ func run() -> void:
 		await frames(2)
 		check(player.get_pickup_target() == item, "The crosshair must identify thrown equipment: " + kind)
 		world._process(0)
-		check("Pick up" in world.attack_status.text and not "Flip grip" in world.attack_status.text, "Pickup hint must take priority over dagger grip.")
+		check(world.hud.has_node("HealthRing") and world.damage_indicator.hits.is_empty() and world.hud.get_node("Crosshair").visible, "Clean HUD must keep aiming without a pickup text hint.")
 		press_e(player)
 		check(player.main_hand == kind and not player.dagger_reverse, "E must equip the aimed main weapon instead of flipping: " + kind)
 		check(player.off_hand == "shield" and not player.off_dropped and player.active_slot == 2 and player.blocking, "Main pickup must preserve the other hand and held guard.")
@@ -191,4 +194,5 @@ func run() -> void:
 	paused = false
 	await process_frame
 	print("PICKUP_SMOKE: ", "PASS" if failures.is_empty() else "FAIL")
+	print("ASSERTION_TOTAL: ", checks, " checks, ", failures.size(), " failures")
 	quit(0 if failures.is_empty() else 1)

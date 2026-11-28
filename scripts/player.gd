@@ -3,11 +3,16 @@ extends CharacterBody3D
 signal hit_confirmed
 signal equipment_changed
 signal death_finished
-signal death_started
+signal death_started(attacker: Node)
+signal fell_out_of_bounds
 signal health_changed
-signal shield_blocked
+signal damage_received(amount: float, bearing: Vector3)
+signal shield_blocked(amount: float, bearing: Vector3)
 const Visuals = preload("res://scripts/visuals.gd")
 const Arrow = preload("res://scripts/arrow.gd")
+const ReplayPose = preload("res://scripts/replay_pose.gd")
+const REPLAY_HISTORY_FRAMES: int = 540
+const REPLAY_SAMPLE_INTERVAL: int = 3
 const WeaponPoses = preload("res://scripts/weapon_poses.gd")
 const Ragdoll = preload("res://scripts/ragdoll.gd")
 const Combat = preload("res://scripts/combat.gd")
@@ -35,24 +40,26 @@ const GRIP_FLIP_TIME: float = 0.3
 const ITEM_THROW_RELEASE: float = 0.34
 const ITEM_THROW_DURATION: float = 0.85
 const PICKUP_REACH: float = 3.0
-const SPEAR_SWITCH_TIME: float = 0.3
+const SPEAR_SWITCH_TIME: float = WeaponPoses.SPEAR_SWITCH_TIME
 const BOW_EQUIP_TIME: float = 0.45
 const BOW_PREPARE_TIME: float = 0.4
-const BOW_RELEASE_TIME: float = 0.1
-const BOW_STRING_TIME: float = 0.15
+const BOW_RELEASE_TIME: float = Visuals.BOW_RELEASE_TIME
+const BOW_STRING_TIME: float = Visuals.BOW_STRING_TIME
 const BOW_COOLDOWN_TIME: float = 0.5
 enum BowPhase { INACTIVE, EQUIP, NOCK, READY, RELEASE, STRING, COOLDOWN }
 const BOW_NOCK_TIME: float = 0.10
-const BOW_BODY_LATERAL_PULL: float = 0.27
-const BOW_BODY_DEPTH: float = 1.42
-const ARM_LENGTHS := Vector2(0.3, 0.31)
+const BOW_BODY_LATERAL_PULL: float = Visuals.BOW_BODY_LATERAL_PULL
 
+var team_id: int = 0
 var controls_active: bool = false
 var third_person: bool = false
 var front_view: bool = false
 var prone: bool = false
 var prone_blend: float = 0
-var health: int = Combat.MAX_HEALTH
+var lethal_source: Dictionary = {}
+var health: float = Combat.MAX_HEALTH
+var regen_elapsed: float = 0
+var struck_ids: Dictionary = {}
 var off_dropped: bool = false
 var item_throw_kind: String = ""
 var item_throw_left: bool = false
@@ -119,6 +126,8 @@ var death_focus: Vector3
 var death_yaw: float = 0
 var death_pitch: float = -0.35
 var death_closeup: bool = false
+var death_record: Dictionary = {}
+var replay_history: Array[Dictionary] = []
 var look_motion: Vector2 = Vector2.ZERO
 var view_sway: Vector2 = Vector2.ZERO
 
@@ -127,6 +136,9 @@ var view_sway: Vector2 = Vector2.ZERO
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_PAUSABLE
 	add_to_group("combat_actors")
+	add_to_group("death_replay_subject")
+	collision_layer = 2
+	collision_mask = 3
 	look_pitch = camera.rotation.x
 	base_fov = camera.fov
 	body_model = Visuals.humanoid(Color("2455d8"))
@@ -279,9 +291,12 @@ func select_slot(slot: int) -> void:
 	equipment_changed.emit()
 
 func reset_for_match() -> void:
+	lethal_source.clear()
 	cancel_special()
 	_reset_melee(true)
 	health = Combat.MAX_HEALTH
+	regen_elapsed = 0
+	struck_ids.clear()
 	health_changed.emit()
 	prone = false
 	prone_blend = 0
@@ -291,7 +306,7 @@ func reset_for_match() -> void:
 	if is_instance_valid(ragdoll):
 		ragdoll.dispose()
 		ragdoll = null
-	collision_layer = 1
+	collision_layer = 2
 	position = SPAWN_POSITION
 	rotation = Vector3.ZERO
 	velocity = Vector3.ZERO
@@ -301,6 +316,8 @@ func reset_for_match() -> void:
 	death_elapsed = 0
 	death_reported = false
 	death_closeup = false
+	death_record.clear()
+	replay_history.clear()
 	camera.fov = base_fov
 	body_model.rotation = Vector3.ZERO
 	body_model.position = Vector3.ZERO
@@ -404,32 +421,51 @@ func get_combat_aim_point() -> Vector3:
 func _combat_eye() -> Vector3:
 	return to_global(Vector3(0, 0.5 if prone else 1.65, -0.9 if prone else 0))
 
-func take_melee_hit(point: Vector3, direction: Vector3, damage: float, _critical: bool) -> bool:
-	return _take_damage(damage, direction)
+func take_melee_hit(point: Vector3, direction: Vector3, damage: float, _critical: bool, attacker: Node = null, source: Dictionary = {}) -> bool:
+	return _take_damage(damage, direction, attacker, "melee", {}, source)
 
-func take_projectile_hit(point: Vector3, direction: Vector3, kind: String) -> bool:
-	return _take_damage(Combat.projectile_damage(kind, Combat.is_head_hit(self, point)), direction)
+func take_projectile_hit(point: Vector3, direction: Vector3, kind: String, attacker: Node = null) -> bool:
+	return take_projectile_contact(point, direction, kind, attacker, {})
 
-func take_kick(_point: Vector3, direction: Vector3) -> bool:
-	return _take_damage(Combat.KICK, direction)
+func take_projectile_contact(point: Vector3, direction: Vector3, kind: String, attacker: Node, trace: Dictionary, source: Dictionary = {}) -> bool:
+	return _take_damage(Combat.projectile_damage(kind, Combat.is_head_hit(self, point)), direction, attacker, kind, trace, source if not source.is_empty() else Combat.damage_source(attacker, kind))
 
-func take_shield_hit(_point: Vector3, direction: Vector3) -> bool:
-	return _take_damage(Combat.SHIELD, direction)
+func take_thrown_hit(direction: Vector3, attacker: Node, source: Dictionary = {}) -> bool:
+	return _take_damage(Combat.MELEE, direction, attacker, "thrown_item", {}, source)
+
+func take_kick(_point: Vector3, direction: Vector3, attacker: Node = null) -> bool:
+	return _take_damage(Combat.KICK, direction, attacker, "kick")
+
+func take_shield_hit(_point: Vector3, direction: Vector3, attacker: Node = null) -> bool:
+	return _take_damage(Combat.SHIELD, direction, attacker, "shield")
 
 func take_hit(_point: Vector3, direction: Vector3) -> bool:
 	return _take_damage(Combat.MELEE, direction)
 
-func _take_damage(amount: float, direction: Vector3) -> bool:
+func _take_damage(amount: float, direction: Vector3, attacker: Node = null, kind: String = "melee", trace: Dictionary = {}, source: Dictionary = {}) -> bool:
 	if not is_alive:
 		return false
 	var incoming := Vector3(-direction.x, 0, -direction.z).normalized()
 	if blocking and _can_block() and (-global_basis.z).dot(incoming) > 0.4:
-		shield_blocked.emit()
+		shield_blocked.emit(amount, Combat.damage_bearing(self, direction, attacker))
 		return false
-	health = maxi(0, health - int(amount))
+	var previous_health: float = health
+	health = maxf(0, health - amount)
+	if health < previous_health:
+		regen_elapsed = 0
+		damage_received.emit(previous_health - health, Combat.damage_bearing(self, direction, attacker))
 	health_changed.emit()
 	if health == 0:
-		die()
+		lethal_source = source.duplicate(true) if not source.is_empty() else Combat.damage_source(attacker, kind)
+		if kind == "arrow" and not trace.is_empty():
+			var shot_frame: int = trace.frames[0]
+			death_record = {
+				"kind": "arrow", "trace": trace, "victim": ReplayPose.capture(self),
+				"history": replay_history.filter(func(pose: Dictionary) -> bool: return pose.frame >= shot_frame - 34),
+			}
+		elif kind == "melee" and is_instance_valid(attacker) and attacker is Node3D:
+			death_record = {"kind": "melee", "attacker": attacker.global_transform}
+		die(attacker, direction)
 	return true
 
 func _set_shadow_mode(node: Node, mode: int) -> void:
@@ -484,7 +520,8 @@ func _update_weapon_pose() -> void:
 		main_mount.scale = Vector3.ONE
 	var raised: float = smoothstep(0.0, 1.0, shield_blend)
 	off_mount.scale = Vector3.ONE * 0.9
-	off_mount.position = Vector3(-0.68, -0.43, -0.85).lerp(Vector3(-0.28, -0.12, -0.75), raised)
+	# Keep the lowered rim visible at the lower-left edge of the view.
+	off_mount.position = Vector3(-0.55, -0.67, -0.65).lerp(Vector3(-0.28, -0.12, -0.75), raised)
 	off_mount.rotation = Vector3(0.15, -0.18, -0.1).lerp(Vector3(0, 0.05, 0), raised)
 	if throwing_item and item_throw_left:
 		var shield_pose: Dictionary = _shield_throw_pose()
@@ -499,28 +536,23 @@ func _update_weapon_pose() -> void:
 	var right_hand: Node3D = right_arm.get_node("Hand")
 	var left_hand: Node3D = left_arm.get_node("Hand")
 	var right_target: Vector3 = pose.hand
-	var left_target := Vector3(-0.31, -0.08, -0.10)
 	var arm_swing: float = sin(gait_phase) * gait_blend
 	if attack_duration == 0 and special_action.is_empty() and not melee_held:
-		right_target.z += arm_swing * (0.15 if main_hand == "fists" else 0.08) * (1 - spear_carry)
-		right_target.y += absf(arm_swing) * 0.045 * (1 - spear_carry)
-	if not blocking:
-		left_target.z -= arm_swing * (0.10 if active_slot == 2 and not off_dropped else 0.16)
-		left_target.y += absf(arm_swing) * 0.04
-	if active_slot == 2 and off_hand == "shield":
-		left_target = left_target.lerp(Vector3(-0.22, 0.43, -0.35), raised)
+		right_target = WeaponPoses.idle_weapon_hand(right_target, arm_swing, main_hand, spear_carry)
+	var held_shield: bool = active_slot == 2 and off_hand == "shield" and not off_dropped
+	var left_target: Vector3 = WeaponPoses.off_hand(0 if blocking else arm_swing, held_shield, raised if held_shield else 0.0)
 	if throwing_item and item_throw_left:
 		left_target = _shield_throw_pose().hand
 	if special_action == "shield":
 		left_target = WeaponPoses.shield_bash(special_elapsed, shield_start_pose).hand
-	Visuals.pose_arm(right_arm, right_target, pose.wrist, 1.0, ARM_LENGTHS, Vector3(0.12, -1, 0.65))
+	Visuals.pose_weapon_arm(right_arm, right_target, pose.wrist, 1.0)
 	var elbow_attack: bool = main_hand == "fists" and ((attack_heavy and attack_duration > 0) or melee_held)
 	var elbow_weight: float = 0
 	if elbow_attack:
 		elbow_weight = sin(Timing.pose_phase(main_hand, attack_elapsed, attack_heavy) * PI) if attack_duration > 0 else smoothstep(0, _charge_limit(), charge_elapsed) * sin(0.42 * PI)
 		var body_pole: Vector3 = Vector3(0.8, -0.2, 0.65).lerp(Vector3(-0.7, 0.15, -1), elbow_weight)
 		Visuals.pose_arm(right_arm, right_target, pose.wrist, 1.0, Vector2(0.3, 0.31), body_pole)
-	Visuals.pose_arm(left_arm, left_target, off_mount.rotation, -1.0, ARM_LENGTHS, Vector3(-0.12, -1, 0.65))
+	Visuals.pose_weapon_arm(left_arm, left_target, off_mount.rotation, -1.0)
 	main_mount.visible = not bow_active() or throwing
 	off_mount.visible = active_slot == 2 and not off_dropped
 	right_hand.visible = not bow_active() or throwing
@@ -545,7 +577,7 @@ func _update_weapon_pose() -> void:
 		view_right_arm.get_node("Palm").scale = Vector3.ONE * 0.55
 	_pose_view_arm(view_left_arm, off_mount.position, off_mount.rotation, -1.0)
 	if bow_active():
-		_pose_archery(left_arm, right_arm, throwing)
+		_pose_archery(arm_swing, throwing)
 	else:
 		body_bow.visible = active_slot == 2 and not off_dropped
 	view_left_arm.visible = active_slot == 2 and (not off_dropped or (throwing_item and item_throw_left))
@@ -663,7 +695,7 @@ func throw_knife() -> void:
 	_begin_special("throw")
 
 func kick() -> void:
-	if not controls_active or not is_alive or prone or not is_on_floor() or _melee_busy() or not special_action.is_empty():
+	if not controls_active or not is_alive or blocking or prone or not is_on_floor() or _melee_busy() or not special_action.is_empty():
 		return
 	_begin_special("kick")
 
@@ -672,7 +704,7 @@ func _can_block() -> bool:
 		return false
 	if special_action == "shield":
 		return Timing.stage("shield", special_elapsed) == "windup"
-	return not _melee_busy() and special_action.is_empty()
+	return not _melee_busy() and (special_action.is_empty() or (special_action == "kick" and Timing.stage("kick", special_elapsed) == "cooldown"))
 
 func shield_attack() -> void:
 	if not controls_active or not is_alive or not blocking or not _can_block() or _melee_busy() or not special_action.is_empty():
@@ -694,11 +726,11 @@ func _resolve_shield() -> bool:
 		return false
 	special_pending = false
 	if hit.collider.has_method("take_shield_hit"):
-		if hit.collider.take_shield_hit(hit.position, direction):
+		if hit.collider.take_shield_hit(hit.position, direction, self):
 			last_hit_critical = false
 			hit_confirmed.emit()
 	elif hit.collider.has_method("take_melee_hit"):
-		if hit.collider.take_melee_hit(hit.position, direction, Combat.SHIELD, false):
+		if hit.collider.take_melee_hit(hit.position, direction, Combat.SHIELD, false, self):
 			last_hit_critical = false
 			hit_confirmed.emit()
 	return true
@@ -735,12 +767,14 @@ func _resolve_kick() -> bool:
 		return false
 	special_pending = false
 	if not hit.is_empty() and hit.collider.has_method("take_hit"):
+		var applied: bool = true
 		if hit.collider.has_method("take_kick"):
-			hit.collider.take_kick(hit.position, direction)
+			applied = hit.collider.take_kick(hit.position, direction, self)
 		else:
 			hit.collider.take_hit(hit.position, direction)
-		last_hit_critical = false
-		hit_confirmed.emit()
+		if applied:
+			last_hit_critical = false
+			hit_confirmed.emit()
 	return true
 
 func _pose_view_arm(arm: Node3D, wrist: Vector3, rotation: Vector3, side: float) -> void:
@@ -752,58 +786,34 @@ func _pose_view_arm(arm: Node3D, wrist: Vector3, rotation: Vector3, side: float)
 	Visuals.pose_arm(arm, wrist, rotation, side, lengths * extension, Vector3(side * 0.1, -1, 0.15), 0.55)
 	arm.get_node("Palm").scale = Vector3.ONE * 0.55
 
-func _pose_archery(left_arm: Node3D, right_arm: Node3D, throwing: bool) -> void:
+func _pose_archery(arm_swing: float, throwing: bool) -> void:
 	var nock_progress: float = smoothstep(0, BOW_NOCK_TIME, bow_prepare_elapsed)
 	var draw: float = bow_visual_draw()
-	var arrow_visible: bool = bow_phase in [BowPhase.NOCK, BowPhase.READY] and not sprinting and special_action.is_empty() and is_alive
+	var arrow_visible: bool = bow_phase in [BowPhase.NOCK, BowPhase.READY] and special_action.is_empty() and is_alive
 	# No new arrow during feedback/recovery. Both rigs follow the same string.
 	if bow_phase in [BowPhase.RELEASE, BowPhase.STRING, BowPhase.COOLDOWN]:
 		nock_progress = 1.0
 	var view_bow: Node3D = off_mount.get_child(0)
 	var zoom_ratio: float = tan(deg_to_rad(camera.fov) / 2) / tan(deg_to_rad(base_fov) / 2)
 	var grip_x: float = 0.38 * zoom_ratio
-	off_mount.position = Vector3(0.15, -0.51, -0.68).lerp(Vector3(grip_x, -0.11, -0.91), bow_stance)
-	off_mount.rotation = Vector3(0.12, 0.03, -1.12).lerp(Vector3(0, 0, 0.06), bow_stance)
+	var lowered_grip := Vector3(0.32, -0.55 + absf(arm_swing) * 0.025, -0.69 - arm_swing * 0.053)
+	off_mount.position = lowered_grip.lerp(Vector3(grip_x, -0.11, -0.91), bow_stance)
+	off_mount.rotation = Vector3(0.32 + arm_swing * 0.11, 0.03, -0.14).lerp(Vector3(0, 0, 0.06), bow_stance)
 	off_mount.scale = Vector3(0.7 * zoom_ratio, 0.7 * zoom_ratio, 0.7)
 	Visuals.pose_bow(view_bow, draw, arrow_visible, nock_progress, 0.0)
 	view_bow.get_node("DrawHand").hide()
 	_pose_view_arm(view_left_arm, off_mount.position, off_mount.rotation, -1.0)
 
-	# Solve the grips in model space while the torso turns side-on.
-	var upper: Node3D = left_arm.get_parent()
-	var pitch: float = clampf(look_pitch, -0.92, 0.92)
-	var aim_pivot := Vector3(-0.10, 0.52, -0.22)
-	var aim_grip: Vector3 = aim_pivot + Basis(Vector3.RIGHT, pitch) * (Vector3(-0.088, 0.75, -0.84) - aim_pivot)
-	var carry_grip := Vector3(-0.17, 0.22, -0.29)
-	var grip: Vector3 = carry_grip.lerp(aim_grip, bow_stance)
-	var carry_rotation := Vector3(0.16, 0.05, -1.08)
-	var rotation_model: Vector3 = carry_rotation.lerp(Vector3(pitch, 0, 0), bow_stance)
-	var upper_inverse: Basis = upper.basis.inverse()
-	var wrist: Vector3 = (upper_inverse * Basis.from_euler(rotation_model)).get_euler()
-	var left_target: Vector3 = upper_inverse * grip
-	var reach_fraction: float = lerpf(0.985, 0.9999, bow_stance)
-	var arm_extension: float = maxf(1.0, left_arm.position.distance_to(left_target) / ((ARM_LENGTHS.x + ARM_LENGTHS.y) * reach_fraction))
-	Visuals.pose_arm(left_arm, left_target, wrist, -1.0, ARM_LENGTHS * arm_extension, upper_inverse * Vector3(-0.25, -1, 0.35), 1.0, reach_fraction)
-	body_bow.position = Vector3.ZERO
-	body_bow.rotation = Vector3.ZERO
-	body_bow.scale = Vector3(1, 1, BOW_BODY_DEPTH)
 	body_bow.show()
-	Visuals.pose_bow(body_bow, draw, arrow_visible, nock_progress, BOW_BODY_LATERAL_PULL)
-	body_bow.get_node("DrawHand").hide()
+	Visuals.pose_body_bow(body_bow, bow_stance, look_pitch, draw, arrow_visible, nock_progress, arm_swing, not throwing)
 	if throwing:
 		return
 
-	var carry_hold := Vector3(0, 0.36, 0.014)
 	var nock_offset: Vector3 = Vector3(0.10, -0.25, 0.20) * (1 - nock_progress)
-	var bow_fingers: Vector3 = Visuals.bow_nock(draw, BOW_BODY_LATERAL_PULL) + nock_offset + Vector3(0.025, 0.012, 0.028)
-	var draw_grip: Vector3 = upper.to_local(body_bow.to_global(carry_hold.lerp(bow_fingers, bow_stance)))
-	var draw_elbow: Vector3 = Vector3(0.36, -1.0, 0.42).lerp(Vector3(0.75, 0.22, 1.0), draw * bow_stance)
-	var draw_wrist: Vector3 = wrist.lerp(Vector3(0, 1.15, -0.18), draw * bow_stance)
-	Visuals.pose_arm(right_arm, draw_grip, draw_wrist, 1.0, ARM_LENGTHS, upper_inverse * draw_elbow)
 	var view_fingers: Vector3 = Visuals.bow_nock(draw, 0.0) + nock_offset + Vector3(0.07, 0.015, 0.055)
-	var view_grip: Vector3 = view_model.to_local(view_bow.to_global(carry_hold.lerp(view_fingers, bow_stance)))
-	_pose_view_arm(view_right_arm, view_grip, Vector3(0, 0, -0.15), 1.0)
-	right_arm.get_node("Hand").hide()
+	var free_hand := Vector3(0.71, -0.57 + absf(arm_swing) * 0.025, -0.48 + arm_swing * 0.07)
+	var view_grip: Vector3 = free_hand.lerp(view_model.to_local(view_bow.to_global(view_fingers)), bow_stance)
+	_pose_view_arm(view_right_arm, view_grip, Vector3(0, 0, -0.15 * bow_stance), 1.0)
 
 func _set_bow_phase(phase: BowPhase) -> void:
 	bow_phase = phase
@@ -811,8 +821,7 @@ func _set_bow_phase(phase: BowPhase) -> void:
 	bow_prepare_elapsed = BOW_PREPARE_TIME if phase == BowPhase.READY else 0.0
 
 func cancel_bow() -> void:
-	# All interruptions restart equipment, including sprint: no preserved shot,
-	# unfinished equip, or recovery can be used to skip the next 0.85 seconds.
+	# Putting away the bow or interrupting it with a special action restarts preparation.
 	_set_bow_phase(BowPhase.EQUIP if bow_active() else BowPhase.INACTIVE)
 	bow_stance = 0
 	zooming = false
@@ -820,7 +829,7 @@ func cancel_bow() -> void:
 		camera.fov = base_fov
 
 func bow_ready() -> bool:
-	return controls_active and is_alive and bow_active() and not sprinting and special_action.is_empty() and bow_phase == BowPhase.READY
+	return controls_active and is_alive and bow_active() and special_action.is_empty() and bow_phase == BowPhase.READY
 
 func bow_visual_draw() -> float:
 	match bow_phase:
@@ -831,10 +840,10 @@ func bow_visual_draw() -> float:
 		BowPhase.RELEASE:
 			# Cosmetic overpull then release only: the projectile already exists.
 			var t: float = bow_phase_elapsed / BOW_RELEASE_TIME
-			return lerpf(1.0, 1.12, t / 0.4) if t < 0.4 else lerpf(1.12, 0.0, smoothstep(0.4, 1.0, t))
+			return Visuals.bow_release_draw(t)
 		BowPhase.STRING:
 			var t: float = bow_phase_elapsed / BOW_STRING_TIME
-			return sin(t * TAU * 2.0) * 0.12 * (1.0 - t)
+			return Visuals.bow_string_draw(t)
 	return 0.0
 
 func bow_status() -> String:
@@ -847,7 +856,7 @@ func bow_status() -> String:
 	return ""
 
 func _tick_bow(delta: float) -> void:
-	var aiming: bool = controls_active and is_alive and bow_active() and not sprinting and special_action.is_empty()
+	var aiming: bool = controls_active and is_alive and bow_active() and special_action.is_empty()
 	if not aiming:
 		_set_bow_phase(BowPhase.EQUIP if bow_active() else BowPhase.INACTIVE)
 		bow_stance = move_toward(bow_stance, 0.0, delta / 0.16)
@@ -903,22 +912,18 @@ func _animate_locomotion(delta: float) -> void:
 	body_model.position = Vector3(0, abs(sin(gait_phase * 2)) * gait_blend * 0.018, 0)
 	var upper: Node3D = body_model.get_node("Upper")
 	var archery: float = bow_stance if bow_active() else 0.0
-	upper.rotation.y = -0.98 * archery
 	upper.rotation.z = sin(gait_phase) * gait_blend * 0.025 * (1 - archery)
+	var footing: float = 0.0
 	if archery > 0 and is_on_floor() and not prone:
-		var footing: float = archery * lerpf(1.0, 0.75, smoothstep(0.05, WALK_SPEED, speed))
-		var left_leg: Node3D = body_model.get_node("LeftLeg")
-		var right_leg: Node3D = body_model.get_node("RightLeg")
-		left_leg.rotation.x = lerpf(left_leg.rotation.x, 0.28, footing)
-		right_leg.rotation.x = lerpf(right_leg.rotation.x, -0.25, footing)
-		left_leg.get_node("Knee").rotation.x = lerpf(left_leg.get_node("Knee").rotation.x, 0.08, footing)
-		right_leg.get_node("Knee").rotation.x = lerpf(right_leg.get_node("Knee").rotation.x, 0.04, footing)
-		body_model.position.y -= 0.026 * footing
+		var release_elapsed: float = INF
+		if bow_phase == BowPhase.RELEASE:
+			release_elapsed = bow_phase_elapsed
+		elif bow_phase == BowPhase.STRING:
+			release_elapsed = BOW_RELEASE_TIME + bow_phase_elapsed
+		footing = Visuals.bow_footing(archery, speed, bow_visual_draw(), release_elapsed)
+	Visuals.pose_bow_stance(body_model, archery, look_pitch, footing, prone_blend)
 	body_model.rotation.x = -PI / 2 * prone_blend
 	body_model.position += Vector3(0, 0.34, 0.55) * prone_blend
-	var helmet: Node3D = upper.get_node("Helmet")
-	helmet.rotation.y = -upper.rotation.y
-	helmet.rotation.x = PI / 2 * prone_blend + clampf(look_pitch, -0.92, 0.92) * archery * (1 - prone_blend)
 	if prone_blend > 0.01:
 		for side: float in [-1.0, 1.0]:
 			var leg: Node3D = body_model.get_node("RightLeg" if side > 0 else "LeftLeg")
@@ -928,25 +933,24 @@ func _animate_locomotion(delta: float) -> void:
 		body_model.get_node("RightLeg").rotation.y = 0
 		body_model.get_node("LeftLeg").rotation.y = 0
 
-func die() -> void:
+func die(attacker: Node = null, impact: Vector3 = Vector3.ZERO) -> void:
 	if not is_alive:
 		return
 	health = 0
 	health_changed.emit()
 	var inherited_velocity: Vector3 = velocity * 0.45
 	is_alive = false
-	set_controls_active(false)
 	attack_duration = 0
 	attack_pending = false
 	death_elapsed = 0
 	death_reported = false
 	velocity.x = 0
 	velocity.z = 0
-	body_model.get_node("Upper").rotation = Vector3.ZERO
 	collision_layer = 0
 	ragdoll = Ragdoll.new()
 	get_parent().add_child(ragdoll)
-	ragdoll.build(body_model, inherited_velocity)
+	ragdoll.build(body_model, inherited_velocity, impact)
+	set_controls_active(false)
 	ragdoll.keep_for_death_view = true
 	death_yaw = rotation.y + 0.55
 	death_pitch = -0.35
@@ -954,7 +958,7 @@ func die() -> void:
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	death_focus = ragdoll.focus_position()
 	_update_camera()
-	death_started.emit()
+	death_started.emit(attacker)
 
 func _melee_busy() -> bool:
 	return attack_duration > 0 or melee_held or (main_hand == "dagger" and dagger_flip_elapsed < GRIP_FLIP_TIME)
@@ -1012,6 +1016,7 @@ func _cancel_melee_input() -> void:
 	dagger_flip_queued = false
 
 func _reset_melee(reset_grip: bool = false) -> void:
+	struck_ids.clear()
 	spear_switch_remaining = 0
 	spear_switch_from.clear()
 	spear_carry = 0
@@ -1078,6 +1083,7 @@ func attack() -> void:
 	_start_attack(false, combo_window > 0 and _can_alternate())
 
 func _start_attack(heavy: bool, chained: bool, prepared: bool = false) -> void:
+	struck_ids.clear()
 	var from: Dictionary = _spear_ready_pose() if spear_switch_remaining > 0 else _melee_pose()
 	swing_direction = -swing_direction if chained and not heavy else 1
 	attack_heavy = heavy
@@ -1120,7 +1126,7 @@ func _tick_melee(delta: float) -> void:
 		if not started:
 			attack_elapsed += delta
 		if attack_pending and Timing.stage(main_hand, attack_elapsed, attack_heavy) == "active":
-			if _resolve_melee():
+			if _resolve_melee() and not Combat.uses_aoe(main_hand, attack_heavy):
 				attack_pending = false
 		if Timing.stage(main_hand, attack_elapsed, attack_heavy) == "done":
 			var continued_pose: Dictionary = _melee_pose()
@@ -1161,6 +1167,13 @@ func _resolve_melee() -> bool:
 		return false
 	var eye: Vector3 = _combat_eye()
 	var direction: Vector3 = (aim_point() - eye).normalized()
+	if Combat.uses_aoe(main_hand, attack_heavy):
+		var damage: float = float(WEAPONS[main_hand].damage) * (2.0 if attack_heavy and main_hand != "fists" else 1.0)
+		var count: int = Combat.sweep(self, get_combat_aim_point(), global_basis * Basis(Vector3.RIGHT, look_pitch) * Vector3.FORWARD, float(WEAPONS[main_hand].reach), damage, attack_heavy, struck_ids)
+		if count > 0:
+			last_hit_critical = attack_heavy
+			hit_confirmed.emit()
+		return count > 0
 	var query := PhysicsRayQueryParameters3D.create(eye, eye + direction * float(WEAPONS[main_hand].reach), 3, [get_rid()])
 	var hit: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
 	if hit.is_empty():
@@ -1169,7 +1182,7 @@ func _resolve_melee() -> bool:
 	if not hit.is_empty() and hit.collider.has_method("take_hit"):
 		var damage: float = float(WEAPONS[main_hand].damage) * (2.0 if attack_heavy and main_hand != "fists" else 1.0)
 		if hit.collider.has_method("take_melee_hit"):
-			if not hit.collider.take_melee_hit(hit.position, direction, damage, attack_heavy):
+			if not hit.collider.take_melee_hit(hit.position, direction, damage, attack_heavy, self):
 				return true
 		else:
 			hit.collider.take_hit(hit.position, direction)
@@ -1179,7 +1192,7 @@ func _resolve_melee() -> bool:
 	return not hit.is_empty()
 
 func shoot_bow() -> void:
-	if not controls_active or not is_alive or not bow_ready() or get_tree().get_nodes_in_group("arrows").size() >= 16:
+	if not controls_active or not is_alive or not bow_ready() or not Combat.can_shoot(get_tree(), self):
 		return
 	_set_bow_phase(BowPhase.RELEASE)
 	var arrow := Arrow.new()
@@ -1252,12 +1265,13 @@ func _unhandled_input(event: InputEvent) -> void:
 				release_melee_charge()
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			if bow_active():
-				zooming = event.pressed and not sprinting
+				zooming = event.pressed
 			else:
 				shield_requested = event.pressed and active_slot == 2 and off_hand == "shield" and not off_dropped
 				blocking = _can_block()
 
 func _physics_process(delta: float) -> void:
+	Combat.regen_tick(self, delta)
 	if not is_alive:
 		death_elapsed += delta
 		_update_camera()
@@ -1312,8 +1326,6 @@ func _physics_process(delta: float) -> void:
 		velocity.x = 0.0
 		velocity.z = 0.0
 	move_and_slide()
-	if sprinting:
-		zooming = false
 	_tick_bow(delta)
 	if spear_switch_remaining <= 0:
 		var carrying: bool = main_hand == "spear" and sprinting and not bow_active() and not _melee_busy() and not blocking and special_action.is_empty()
@@ -1321,7 +1333,16 @@ func _physics_process(delta: float) -> void:
 	_animate_locomotion(delta)
 	_update_camera()
 	_update_weapon_pose()
+	_record_replay_frame()
 	# The map has an edge. Falling off returns the player to the starting point.
 	if global_position.y < -20.0:
-		global_position = SPAWN_POSITION
 		velocity = Vector3.ZERO
+		fell_out_of_bounds.emit()
+
+func _record_replay_frame() -> void:
+	var frame: int = Engine.get_physics_frames()
+	if not controls_active or (not replay_history.is_empty() and frame - int(replay_history.back().frame) < REPLAY_SAMPLE_INTERVAL):
+		return
+	replay_history.append(ReplayPose.capture(self))
+	while not replay_history.is_empty() and frame - int(replay_history.front().frame) > REPLAY_HISTORY_FRAMES:
+		replay_history.pop_front()

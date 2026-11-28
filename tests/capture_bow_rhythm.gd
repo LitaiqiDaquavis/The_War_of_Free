@@ -37,6 +37,7 @@ func capture() -> void:
 	world = load("res://scenes/main.tscn").instantiate()
 	world.settings_path = "user://capture-bow-settings.cfg"
 	world.training_mode = true
+	world.battle_mode = false
 	root.add_child(world)
 	world.start_game()
 	player = world.player
