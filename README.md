@@ -1,13 +1,14 @@
 # The War of Freedom
-Adapted from the game *War the Knights*, but no textures or maps were copied.
+Inspired by *War the Knights*, but no textures or maps were copied.
 
 ## Current progress
 - [x] The basic map and game character
 - [x] Melee wepons, bow , shield and armor
 - [x] Throwing knife and fire arrow
-- [x] Kick, lying down and crawl
+- [x] Kick and prone
 - [ ] Terrain and more maps
-- [ ] The Knights' AI
+- [x] The Knights' AI
+- [ ] Points
 - [ ] Story plot
 
 ## What's this
@@ -19,3 +20,23 @@ Players need to do is lead their teams in resistance.
 I've played the game *War the Knight* before.  
 I found it quite fun, but I also noticed a few areas for improvement.  
 I discovered that the game's code was closed-source, so I decided to start from scratch.
+
+## Default controls
+| Input | Action |
+| --- | --- |
+| WASD / Mouse | Move / Look around |
+| Shift / Space / Z | Sprint / Jump / Go prone |
+| P | Switch camera view |
+| 1 / 2 | Main hand only / Use off-hand equipment |
+| Left mouse | Attack, shield bash while guarding, or fire a ready arrow |
+| Right mouse | Raise shield or zoom with the bow |
+| Q / F / G | Throw a knife / Kick / Throw held equipment |
+| E | Pick up equipment or flip the dagger grip |
+| Esc | Pause |
+
+
+## Inspiration and license
+
+Inspired by *War the Knights*. The code, models, textures, and maps were
+created independently for this project.
+Released under the [Apache License 2.0](LICENSE).
