@@ -28,12 +28,22 @@ I discovered that the game's code was closed-source, so I decided to start from 
 | Shift / Space / Z | Sprint / Jump / Go prone |
 | P | Switch camera view |
 | 1 / 2 | Main hand only / Use off-hand equipment |
-| Left mouse | Attack, shield bash while guarding, or fire a ready arrow |
-| Right mouse | Raise shield or zoom with the bow |
+| LMB | Attack, shield bash while guarding, or fire a ready arrow |
+| RMB | Raise shield or zoom with the bow |
 | Q / F / G | Throw a knife / Kick / Throw held equipment |
 | E | Pick up equipment or flip the dagger grip |
 | Esc | Pause |
 
+### LMB
+Without raising a shield,  
+the character will either **swing their weapon** (melee) or **fire an arrow** (bow).
+When raising the shield, it will be used to **slap** the enemy.
+But if you hold down the button, 
+you can unleash a **critical hit** (melee) or an **elbow strike** (fists).
+
+### RMB
+When you hold a shield, you **raise the shield**.
+But if you have a bow, you can **zoom** in twice as much.
 
 ## Inspiration and license
 
